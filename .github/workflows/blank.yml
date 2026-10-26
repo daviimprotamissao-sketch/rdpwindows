@@ -1,0 +1,311 @@
+# ══════════ Feito por Daviz ══════════
+name: 🎮 Gaming RDP
+
+on:
+  workflow_dispatch:
+    inputs:
+      runner:
+        description: "Imagem do Windows (2022 ≈ Win10 · 2025 ≈ Win11)"
+        type: choice
+        options:
+          - windows-2022
+          - windows-2025
+        default: windows-2022
+      horas:
+        description: "Duração da sessão em horas, com ponto (máx. 5.5)"
+        type: string
+        default: "5"
+      nome_gpu:
+        description: "Nome cosmético da GPU (vazio = não mexer)"
+        type: string
+        default: "NVIDIA GeForce RTX 4080"
+      desativar_defender:
+        description: "Desativar Defender/SmartScreen (VM descartável)"
+        type: boolean
+        default: true
+      mesa_cpu_opengl:
+        description: "Baixar Mesa3D (OpenGL por CPU) em C:\\Mesa3D"
+        type: boolean
+        default: true
+      runtimes_jogos:
+        description: "Instalar VC++ Redist + DirectX (jogos antigos)"
+        type: boolean
+        default: true
+
+concurrency:
+  group: gaming-rdp
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  rdp:
+    name: "🖥️ Sessão de jogo"
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 360
+    defaults:
+      run:
+        shell: pwsh
+
+    steps:
+      # ───────────────────────── 1 · segredos ─────────────────────────
+      - name: "🔐 Conferir segredos"
+        env:
+          K: ${{ secrets.TAILSCALE_AUTHKEY }}
+          P: ${{ secrets.RDP_PASSWORD }}
+        run: |
+          if (-not $env:K) { throw 'Falta o segredo TAILSCALE_AUTHKEY' }
+          if (-not $env:P -or $env:P.Length -lt 12) { throw 'RDP_PASSWORD precisa ter 12+ caracteres' }
+          Write-Host '✅ Segredos ok'
+
+      # ───────────────────── 2 · CPU, RDP e firewall ──────────────────
+      - name: "⚡ CPU, RDP e firewall"
+        run: |
+          $ErrorActionPreference = 'Continue'
+          function Set-Reg($Path, $Name, $Value, $Type = 'DWord') {
+            if (-not (Test-Path $Path)) { New-Item -Path $Path -Force | Out-Null }
+            New-ItemProperty -Path $Path -Name $Name -Value $Value -PropertyType $Type -Force | Out-Null
+          }
+
+          Write-Host '::group::⚡ CPU em alto desempenho'
+          powercfg /setactive 8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c
+          powercfg /setacvalueindex SCHEME_CURRENT SUB_PROCESSOR PROCTHROTTLEMIN 100
+          powercfg /setacvalueindex SCHEME_CURRENT SUB_PROCESSOR CPMINCORES 100
+          powercfg /change monitor-timeout-ac 0
+          powercfg /change standby-timeout-ac 0
+          powercfg /setactive SCHEME_CURRENT
+          Write-Host '::endgroup::'
+
+          Write-Host '::group::🖥️ RDP turbo'
+          $ts  = 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server'
+          $pol = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services'
+          Set-Reg $ts 'fDenyTSConnections' 0
+          Set-Reg "$ts\WinStations" 'DWMFRAMEINTERVAL' 15      # 60 FPS (o padrão é 30)
+          Set-Reg $pol 'bEnumerateHWBeforeSW' 1                 # usa GPU de hardware, se existir
+          Set-Reg $pol 'AVC444ModePreferred' 1                  # H.264 4:4:4 (imagem mais nítida)
+          Set-Reg $pol 'AVCHardwareEncodePreferred' 1
+          Set-Reg 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System' 'VerboseStatus' 1
+          Set-Service TermService -StartupType Automatic
+          Start-Service TermService -ErrorAction SilentlyContinue
+          Write-Host '::endgroup::'
+
+          Write-Host '::group::🔥 Firewall (RDP só pela Tailscale)'
+          $tailnet = '100.64.0.0/10', 'fd7a:115c:a1e0::/48'
+          foreach ($p in 'TCP', 'UDP') {
+            New-NetFirewallRule -DisplayName "RDP via Tailscale ($p)" -Direction Inbound -Protocol $p `
+              -LocalPort 3389 -RemoteAddress $tailnet -Action Allow -Profile Any | Out-Null
+          }
+          Get-NetFirewallRule -DisplayGroup 'Remote Desktop' -ErrorAction SilentlyContinue |
+            Set-NetFirewallRule -RemoteAddress $tailnet -Profile Any -ErrorAction SilentlyContinue
+          Write-Host '::endgroup::'
+          exit 0
+
+      # ───────────────────────── 3 · usuário ──────────────────────────
+      - name: "👤 Usuário RDP (administrador)"
+        env:
+          RDP_USER: gamer
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $senha = ConvertTo-SecureString $env:RDP_PASSWORD -AsPlainText -Force
+          if (Get-LocalUser -Name $env:RDP_USER -ErrorAction SilentlyContinue) {
+            Set-LocalUser -Name $env:RDP_USER -Password $senha
+          } else {
+            New-LocalUser -Name $env:RDP_USER -Password $senha -FullName 'Gamer' `
+              -PasswordNeverExpires -AccountNeverExpires | Out-Null
+          }
+          foreach ($g in 'Administrators', 'Remote Desktop Users') {
+            Add-LocalGroupMember -Group $g -Member $env:RDP_USER -ErrorAction SilentlyContinue
+          }
+          Write-Host "✅ Usuário '$($env:RDP_USER)' pronto (administrador + RDP)"
+
+      # ───────────────────────── 4 · áudio ────────────────────────────
+      - name: "🔊 Áudio e microfone via RDP"
+        run: |
+          $ErrorActionPreference = 'Continue'
+          function Set-Reg($Path, $Name, $Value, $Type = 'DWord') {
+            if (-not (Test-Path $Path)) { New-Item -Path $Path -Force | Out-Null }
+            New-ItemProperty -Path $Path -Name $Name -Value $Value -PropertyType $Type -Force | Out-Null
+          }
+          # O runner não tem placa de som: o RDP cria o dispositivo virtual "Remote Audio".
+          # Para isso o Windows Audio precisa estar rodando ANTES de você conectar.
+          foreach ($s in 'AudioEndpointBuilder', 'Audiosrv') {
+            Set-Service -Name $s -StartupType Automatic
+            Start-Service -Name $s -ErrorAction SilentlyContinue
+          }
+          $pol = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services'
+          Set-Reg $pol 'fDisableAudio' 0          # reprodução de áudio permitida
+          Set-Reg $pol 'fDisableAudioCapture' 0   # microfone permitido (chat de voz)
+          Get-Service AudioEndpointBuilder, Audiosrv | Format-Table Name, Status, StartType -AutoSize | Out-String | Write-Host
+          exit 0
+
+      # ──────────────── 5 · Defender / SmartScreen (opcional) ─────────
+      - name: "🛡️ Defender, SmartScreen e downloads"
+        if: inputs.desativar_defender
+        run: |
+          $ErrorActionPreference = 'Continue'
+          function Set-Reg($Path, $Name, $Value, $Type = 'DWord') {
+            if (-not (Test-Path $Path)) { New-Item -Path $Path -Force | Out-Null }
+            New-ItemProperty -Path $Path -Name $Name -Value $Value -PropertyType $Type -Force | Out-Null
+          }
+          try {
+            Set-MpPreference -DisableRealtimeMonitoring $true -DisableBehaviorMonitoring $true `
+              -DisableIOAVProtection $true -DisableScriptScanning $true -PUAProtection Disabled -ErrorAction Stop
+            Add-MpPreference -ExclusionPath 'C:\', 'D:\' -ErrorAction Stop
+            Write-Host '✅ Defender: proteção em tempo real desativada'
+          } catch { Write-Warning "Defender não aceitou: $($_.Exception.Message)" }
+          Set-Reg 'HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender' 'DisableAntiSpyware' 1
+          Set-Reg 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\System' 'EnableSmartScreen' 0
+          Set-Reg 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer' 'SmartScreenEnabled' 'Off' 'String'
+          Set-Reg 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\Attachments' 'SaveZoneInformation' 1
+          # Windows Server bloqueia download de .exe sem desligar o IE ESC
+          foreach ($id in '{A509B1A7-37EF-4b3f-8CFC-4F3A74704073}', '{A509B1A8-37EF-4b3f-8CFC-4F3A74704073}') {
+            Set-Reg "HKLM:\SOFTWARE\Microsoft\Active Setup\Installed Components\$id" 'IsInstalled' 0
+          }
+          Write-Host '⚠️ Esta VM é descartável: não entre em contas pessoais e cuidado com executáveis de origem duvidosa.'
+          exit 0
+
+      # ───────────────────────── 6 · Tailscale ────────────────────────
+      - name: "🔗 Tailscale"
+        uses: tailscale/github-action@v4
+        with:
+          authkey: ${{ secrets.TAILSCALE_AUTHKEY }}
+          hostname: gh-gaming-${{ github.run_number }}
+
+      - name: "✅ Pronto para conectar"
+        run: |
+          $exe = (Get-Command tailscale -ErrorAction SilentlyContinue).Source
+          if (-not $exe) { $exe = 'C:\Program Files\Tailscale\tailscale.exe' }
+          $st = & $exe status --json | ConvertFrom-Json
+          Write-Host "Tailscale: $($st.BackendState)"
+          $linhas = @(
+            '## 🎮 Sessão pronta',
+            '',
+            ('- **Dispositivo no Tailscale:** `gh-gaming-' + $env:GITHUB_RUN_NUMBER + '`'),
+            '- **Usuário:** `gamer` · **Senha:** segredo `RDP_PASSWORD`',
+            '- **Porta 3389** liberada só para a sua tailnet',
+            '- **Som:** conexão RDP com "Reproduzir neste dispositivo"',
+            '- **Encerrar antes:** crie o arquivo `C:\Users\Public\PARAR.txt` ou cancele o workflow',
+            '',
+            'As etapas abaixo (espaço, GPU, Mesa3D, runtimes) continuam rodando enquanto você já pode conectar.'
+          )
+          $linhas | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+          exit 0
+
+      # ──────────────────── 7 · extras (em segundo plano) ─────────────
+      - name: "🧹 Liberar espaço em disco"
+        continue-on-error: true
+        run: |
+          $ErrorActionPreference = 'Continue'
+          function Mostrar($titulo) {
+            Write-Host "::group::💾 $titulo"
+            Get-PSDrive -PSProvider FileSystem |
+              Select-Object Name,
+                @{ n = 'Usado_GB'; e = { [math]::Round($_.Used / 1GB, 1) } },
+                @{ n = 'Livre_GB'; e = { [math]::Round($_.Free / 1GB, 1) } } |
+              Format-Table -AutoSize | Out-String | Write-Host
+            Write-Host '::endgroup::'
+          }
+          Mostrar 'Espaço antes'
+          $alvos = @(
+            'C:\Android',
+            'C:\Program Files (x86)\Android',
+            'C:\Program Files\Android',
+            'C:\hostedtoolcache\windows',
+            'C:\Strawberry'
+          ) | Where-Object { Test-Path $_ }
+          Write-Host '::group::🗑️ Removendo ferramentas pré-instaladas do runner'
+          $alvos | ForEach-Object -Parallel {
+            Write-Host "  $_"
+            cmd /c "rd /s /q `"$_`"" 2>$null | Out-Null
+          } -ThrottleLimit 5
+          Write-Host '::endgroup::'
+          if (Get-Command docker -ErrorAction SilentlyContinue) { docker system prune -a -f 2>$null | Out-Null }
+          Mostrar 'Espaço depois'
+          exit 0
+
+      - name: "🎴 GPU cosmética"
+        if: inputs.nome_gpu != ''
+        continue-on-error: true
+        env:
+          GPU_NAME: ${{ inputs.nome_gpu }}
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $cls = 'HKLM:\SYSTEM\CurrentControlSet\Control\Class\{4d36e968-e325-11ce-bfc1-08002be10318}'
+          Get-ChildItem $cls -ErrorAction SilentlyContinue |
+            Where-Object { $_.PSChildName -match '^\d{4}$' } |
+            ForEach-Object {
+              $p = Get-ItemProperty $_.PSPath -ErrorAction SilentlyContinue
+              if ($p.DriverDesc) {
+                try {
+                  Set-ItemProperty $_.PSPath -Name DriverDesc -Value $env:GPU_NAME
+                  New-ItemProperty $_.PSPath -Name 'HardwareInformation.AdapterString' -Value $env:GPU_NAME -PropertyType String -Force | Out-Null
+                  New-ItemProperty $_.PSPath -Name 'HardwareInformation.ChipType' -Value $env:GPU_NAME -PropertyType String -Force | Out-Null
+                  New-ItemProperty $_.PSPath -Name 'HardwareInformation.qwMemorySize' -Value 17179869184 -PropertyType QWord -Force | Out-Null
+                  Write-Host "🎴 $($p.DriverDesc) → $($env:GPU_NAME)"
+                } catch { Write-Warning $_.Exception.Message }
+              }
+            }
+          Get-CimInstance Win32_VideoController | Select-Object Name | Format-Table | Out-String | Write-Host
+          Write-Host 'ℹ️ Só o nome muda (e nem toda ferramenta lê esse campo). O desempenho continua sendo o da CPU.'
+          exit 0
+
+      - name: "🧊 Mesa3D (OpenGL por CPU)"
+        if: inputs.mesa_cpu_opengl
+        continue-on-error: true
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $h = @{ 'User-Agent' = 'gaming-rdp'; Authorization = "Bearer $env:GITHUB_TOKEN" }
+          $rel = Invoke-RestMethod 'https://api.github.com/repos/pal1000/mesa-dist-win/releases/latest' -Headers $h
+          $asset = $rel.assets | Where-Object { $_.name -match 'release-msvc\.7z$' } | Select-Object -First 1
+          if (-not $asset) { throw 'Pacote release-msvc do Mesa3D não encontrado' }
+          $arq = Join-Path $env:RUNNER_TEMP $asset.name
+          Invoke-WebRequest $asset.browser_download_url -OutFile $arq
+          $sz = 'C:\Program Files\7-Zip\7z.exe'
+          & $sz x $arq '-oC:\Mesa3D' -y | Out-Null
+
+          [Environment]::SetEnvironmentVariable('GALLIUM_DRIVER', 'llvmpipe', 'Machine')
+          [Environment]::SetEnvironmentVariable('LP_NUM_THREADS', [string][Environment]::ProcessorCount, 'Machine')
+
+          @(
+            'param([Parameter(Mandatory)][string]$Pasta, [string]$Arq = "x64")',
+            'foreach ($f in "opengl32.dll","libgallium_wgl.dll","libglapi.dll") {',
+            '  $s = "C:\Mesa3D\$Arq\$f"',
+            '  if (Test-Path $s) { Copy-Item $s $Pasta -Force; "ok: $f" }',
+            '}'
+          ) | Set-Content 'C:\Mesa3D\usar-mesa.ps1' -Encoding utf8
+
+          Get-ChildItem C:\Mesa3D | Select-Object -ExpandProperty Name | Write-Host
+          Write-Host "✅ Mesa3D em C:\Mesa3D · por jogo: C:\Mesa3D\usar-mesa.ps1 -Pasta 'C:\Games\SeuJogo'"
+          Write-Host 'ℹ️ Renderização por CPU: serve para jogos leves/antigos em OpenGL. DirectX já cai no WARP sozinho.'
+
+      - name: "📦 Runtimes para jogos"
+        if: inputs.runtimes_jogos
+        continue-on-error: true
+        run: |
+          choco install vcredist-all directx -y --no-progress
+          exit 0
+
+      # ──────────────────────── 8 · manter a sessão ───────────────────
+      - name: "⏳ Sessão ativa"
+        env:
+          HORAS: ${{ inputs.horas }}
+        run: |
+          $h = 5.0
+          try { $h = [double]$env:HORAS } catch { }
+          $min  = [int][Math]::Min([Math]::Max($h * 60, 5), 330)
+          $fim  = (Get-Date).AddMinutes($min)
+          $stop = 'C:\Users\Public\PARAR.txt'
+          Write-Host "🟢 Sessão ativa por até $min min. Para encerrar antes: crie $stop (ou cancele o workflow)."
+          $ultimo = Get-Date
+          while ((Get-Date) -lt $fim -and -not (Test-Path $stop)) {
+            Start-Sleep -Seconds 20
+            if (((Get-Date) - $ultimo).TotalMinutes -ge 15) {
+              $ultimo = Get-Date
+              Write-Host ('⏳ restam {0:n0} min' -f ($fim - (Get-Date)).TotalMinutes)
+            }
+          }
+          Write-Host '🔴 Encerrando a sessão.'
