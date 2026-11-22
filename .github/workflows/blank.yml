@@ -57,9 +57,10 @@ on:
         type: boolean
         default: false
 
+# Não cancelar a sessão remota atual quando outra execução for solicitada.
 concurrency:
   group: windows-remoto
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 permissions:
   contents: read
@@ -301,6 +302,10 @@ jobs:
           hostname: ${{ inputs.nome_maquina }}
           # o runner não precisa do DNS nem das rotas da sua tailnet (evita quebrar a internet dele)
           args: "--accept-dns=false --accept-routes=false"
+          # Dá mais tempo para a autenticação e para a propagação do novo dispositivo.
+          timeout: 5m
+          retry: 10
+          log-mode: normal
 
       - name: "✅ Pronto para conectar"
         env:
@@ -385,4 +390,186 @@ jobs:
 
           Write-Host '::group::🈂️ Instalando o idioma português (Brasil): pode levar alguns minutos'
           foreach ($s in 'bits', 'wuauserv', 'UsoSvc') {
-            try { Set-Service -Name $s -StartupType Manual -ErrorAction Stop;
+            try { Set-Service -Name $s -StartupType Manual -ErrorAction Stop; Start-Service -Name $s -ErrorAction SilentlyContinue } catch { }
+          }
+          $ok = $false
+          try {
+            Install-Language -Language pt-BR -ErrorAction Stop | Out-Host
+            $ok = $true
+          } catch { Write-Host ('::warning::Não consegui instalar o idioma: ' + $_.Exception.Message) }
+
+          if ($ok) {
+            # deixa o português como idioma de exibição de quem já tem perfil e dos perfis novos
+            $reg = Join-Path $env:windir 'System32\reg.exe'
+            $perfis = @(Get-ChildItem 'Registry::HKEY_USERS' -ErrorAction SilentlyContinue | Where-Object { $_.PSChildName -match '^S-1-5-21-[0-9-]+$' })
+            foreach ($p in $perfis) {
+              & $reg add ('HKU\' + $p.PSChildName + '\Control Panel\Desktop') /v PreferredUILanguages /t REG_MULTI_SZ /d pt-BR /f | Out-Null
+            }
+            & $reg load 'HKU\PadraoTmp' 'C:\Users\Default\NTUSER.DAT' | Out-Null
+            if ($LASTEXITCODE -eq 0) {
+              & $reg add 'HKU\PadraoTmp\Control Panel\Desktop' /v PreferredUILanguages /t REG_MULTI_SZ /d pt-BR /f | Out-Null
+              [GC]::Collect(); [GC]::WaitForPendingFinalizers()
+              & $reg unload 'HKU\PadraoTmp' | Out-Null
+            }
+            Write-Host '✅ Idioma instalado. Desconecte do RDP e conecte de novo para ver o Windows em português.'
+          } else {
+            Write-Host '::warning::A interface continua em inglês. Região, teclado ABNT2 e fuso do Brasil já estão aplicados.'
+          }
+          Write-Host '::endgroup::'
+          exit 0
+
+      - name: "🛡️ Liberar downloads (Defender e SmartScreen)"
+        if: inputs.liberar_downloads
+        continue-on-error: true
+        run: |
+          $ErrorActionPreference = 'Continue'
+          function Set-Reg($Path, $Name, $Value, $Type = 'DWord') {
+            if (-not (Test-Path $Path)) { New-Item -Path $Path -Force | Out-Null }
+            New-ItemProperty -Path $Path -Name $Name -Value $Value -PropertyType $Type -Force | Out-Null
+          }
+          try {
+            $mp = Get-MpPreference -ErrorAction Stop
+            if ($mp.DisableRealtimeMonitoring) {
+              Write-Host 'ℹ️ O Defender já vem desativado neste runner.'
+            } else {
+              Set-MpPreference -DisableRealtimeMonitoring $true -DisableBehaviorMonitoring $true `
+                -DisableIOAVProtection $true -DisableScriptScanning $true -PUAProtection Disabled -ErrorAction Stop
+              Write-Host '✅ Defender: proteção em tempo real desativada'
+            }
+          } catch { Write-Host ('::warning::Defender: ' + $_.Exception.Message) }
+          Set-Reg 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\System' 'EnableSmartScreen' 0
+          Set-Reg 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer' 'SmartScreenEnabled' 'Off' 'String'
+          Set-Reg 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\Attachments' 'SaveZoneInformation' 1
+          # o Windows Server bloqueia downloads de .exe no navegador antigo (IE ESC)
+          foreach ($id in '{A509B1A7-37EF-4b3f-8CFC-4F3A74704073}', '{A509B1A8-37EF-4b3f-8CFC-4F3A74704073}') {
+            Set-Reg "HKLM:\SOFTWARE\Microsoft\Active Setup\Installed Components\$id" 'IsInstalled' 0
+          }
+          Write-Host '✅ SmartScreen desligado e downloads liberados'
+          Write-Host '⚠️ Esta VM é descartável: não entre em contas pessoais e cuidado com executáveis de origem duvidosa.'
+          exit 0
+
+      - name: "🧰 Instalar programas (Chocolatey)"
+        if: inputs.programas != ''
+        continue-on-error: true
+        env:
+          PROGRAMAS: ${{ inputs.programas }}
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $padrao = '^[A-Za-z0-9][A-Za-z0-9._-]*$'
+          $todos  = @($env:PROGRAMAS -split '[\s,;]+' | Where-Object { $_ })
+          $ruins  = @($todos | Where-Object { $_ -notmatch $padrao })
+          $lista  = @($todos | Where-Object { $_ -match $padrao })
+          if ($ruins.Count -gt 0) { Write-Host ('::warning::Nomes ignorados (inválidos): ' + ($ruins -join ', ')) }
+          if ($lista.Count -eq 0) { Write-Host 'Nenhum programa válido na lista.'; exit 0 }
+          Write-Host ('📦 Instalando: ' + ($lista -join ', '))
+          choco install @lista -y --no-progress --limit-output
+          exit 0
+
+      - name: "🧹 Liberar espaço em disco"
+        if: inputs.liberar_espaco
+        continue-on-error: true
+        run: |
+          $ErrorActionPreference = 'Continue'
+          function Mostrar($titulo) {
+            Write-Host "::group::💾 $titulo"
+            Get-PSDrive -PSProvider FileSystem |
+              Select-Object Name,
+                @{ n = 'Usado_GB'; e = { [math]::Round($_.Used / 1GB, 1) } },
+                @{ n = 'Livre_GB'; e = { [math]::Round($_.Free / 1GB, 1) } } |
+              Format-Table -AutoSize | Out-String | Write-Host
+            Write-Host '::endgroup::'
+          }
+          Mostrar 'Espaço antes'
+          $alvos = @(
+            'C:\Android',
+            'C:\Program Files (x86)\Android',
+            'C:\Program Files\Android',
+            'C:\hostedtoolcache\windows',
+            'C:\Strawberry'
+          ) | Where-Object { Test-Path $_ }
+          # apaga tudo ao mesmo tempo: bem mais rápido do que uma pasta por vez
+          $procs = @(foreach ($a in $alvos) {
+            Write-Host "  🗑️ $a"
+            Start-Process -FilePath cmd.exe -ArgumentList '/c', 'rd', '/s', '/q', "`"$a`"" -WindowStyle Hidden -PassThru
+          })
+          if ($procs.Count -gt 0) { $procs | Wait-Process -Timeout 900 -ErrorAction SilentlyContinue }
+          Mostrar 'Espaço depois'
+          exit 0
+
+      # ───────────────── 7 · manter a sessão ─────────────────
+      - name: "⏳ Sessão ativa"
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $fim    = [long]$env:SESSAO_FIM
+          $ocioso = [int]$env:OCIOSO_MIN
+          $parar  = 'C:\Users\Public\PARAR.txt'
+
+          function Agora { [DateTimeOffset]::UtcNow.ToUnixTimeSeconds() }
+          function Conectado { @(Get-NetTCPConnection -LocalPort 3389 -State Established -ErrorAction SilentlyContinue).Count -gt 0 }
+          function Avisar($texto) {
+            Write-Host "📣 $texto"
+            try { & (Join-Path $env:windir 'System32\msg.exe') '*' '/TIME:120' $texto 2>$null } catch { }
+          }
+
+          $fimBr = [DateTimeOffset]::FromUnixTimeSeconds($fim).ToOffset([TimeSpan]::FromHours(-3)).ToString('HH:mm')
+          Write-Host "🟢 Sessão ativa até as $fimBr (horário de Brasília)."
+          Write-Host "   Para encerrar antes: ícone 'Encerrar-sessao' na Área de Trabalho, arquivo $parar, ou cancele o workflow."
+          if ($ocioso -gt 0) { Write-Host "   Se ninguém ficar conectado por $ocioso min, a sessão encerra sozinha." }
+
+          $semCliente = Agora
+          $ultimoLog  = 0
+          $ultimaVerificacaoTS = 0
+          $avisou10   = $false
+          $avisou2    = $false
+          $tsExe = 'C:\Program Files\Tailscale\tailscale.exe'
+          while ($true) {
+            $t = Agora
+            if ($t -ge $fim) { Write-Host '⏰ Tempo da sessão esgotado.'; break }
+            if (Test-Path $parar) { Write-Host '🛑 Pedido de encerramento recebido.'; break }
+
+            # Verifica o serviço Tailscale durante toda a sessão. Se o serviço parar,
+            # tenta iniciá-lo novamente para não perder o acesso remoto.
+            if (($t - $ultimaVerificacaoTS) -ge 30) {
+              $ultimaVerificacaoTS = $t
+              try {
+                $svc = Get-Service -Name 'Tailscale' -ErrorAction Stop
+                if ($svc.Status -ne 'Running') {
+                  Write-Host '⚠️ Serviço Tailscale parado; tentando iniciar novamente...'
+                  Start-Service -Name 'Tailscale' -ErrorAction Stop
+                  Start-Sleep -Seconds 5
+                }
+                if (Test-Path $tsExe) {
+                  $tsStatus = (& $tsExe status --json 2>$null | ConvertFrom-Json -ErrorAction SilentlyContinue)
+                  if ($tsStatus -and $tsStatus.BackendState -ne 'Running') {
+                    Write-Host "⚠️ Tailscale em estado '$($tsStatus.BackendState)'. Reiniciando o serviço..."
+                    Restart-Service -Name 'Tailscale' -Force -ErrorAction Stop
+                    Start-Sleep -Seconds 10
+                    $tsStatus = (& $tsExe status --json 2>$null | ConvertFrom-Json -ErrorAction SilentlyContinue)
+                    if ($tsStatus) { Write-Host "🔗 Estado da Tailscale após recuperação: $($tsStatus.BackendState)" }
+                  }
+                }
+              } catch { Write-Host ('::warning::Verificação/recuperação da Tailscale: ' + $_.Exception.Message) }
+            }
+
+            $conectado = Conectado
+            if ($conectado) {
+              $semCliente = $t
+            } elseif ($ocioso -gt 0 -and ($t - $semCliente) -ge ($ocioso * 60)) {
+              Write-Host "💤 Ninguém conectado há $ocioso min: encerrando para não gastar à toa."
+              break
+            }
+
+            $restam = [int][Math]::Ceiling(($fim - $t) / 60)
+            if (-not $avisou10 -and $restam -le 10) { $avisou10 = $true; Avisar 'A sessão termina em 10 minutos. Salve o que estiver fazendo.' }
+            if (-not $avisou2 -and $restam -le 2) { $avisou2 = $true; Avisar 'A sessão termina em 2 minutos!' }
+
+            if (($t - $ultimoLog) -ge 900) {
+              $ultimoLog = $t
+              $estado = 'desconectado'
+              if ($conectado) { $estado = 'conectado' }
+              Write-Host ('⏳ restam {0} min · cliente {1}' -f $restam, $estado)
+            }
+            Start-Sleep -Seconds 15
+          }
+          Write-Host '🔴 Encerrando a sessão. A Tailscale desconecta sozinha ao fim do job.'
+
